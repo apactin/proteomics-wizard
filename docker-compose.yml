@@ -1,6 +1,6 @@
 services:
   proteomics-wizard:
-    build: .
+    image: ghcr.io/apactin/proteomics-wizard:latest
     ports:
       - "8525:8525"
     environment:
