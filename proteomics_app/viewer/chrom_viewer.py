@@ -84,6 +84,36 @@ def normalize_site(s: str) -> str:
     s = s.replace(" - ", "-").replace("- ", "-").replace(" -", "-")
     return s
 
+def _get_peak1_rt(rep_df: pd.DataFrame) -> Optional[float]:
+    """
+    Infer Peak1 RT for a replicate group.
+    Uses the median sky_peak1_rt across traces (robust to noise).
+    """
+    if "peak1_rt" not in rep_df.columns:
+        return None
+
+    vals = pd.to_numeric(rep_df["peak1_rt"], errors="coerce").dropna()
+    if vals.empty:
+        return None
+
+    return float(vals.median())
+
+
+
+def _get_peak2_rt(rep_df: pd.DataFrame) -> Optional[float]:
+    """
+    Infer Peak2 RT for a replicate group.
+    Uses the median sky_peak2_rt across traces.
+    """
+    if "peak2_rt" not in rep_df.columns:
+        return None
+
+    vals = pd.to_numeric(rep_df["peak2_rt"], errors="coerce").dropna()
+    if vals.empty:
+        return None
+
+    return float(vals.median())
+
 
 def infer_window_from_filename(file_name: str, ms_level: str) -> str:
     fn = (file_name or "").lower()
@@ -175,6 +205,32 @@ def plot_replicate_overlay(rep_df: pd.DataFrame, title: str, *, max_traces: int,
             label = f"mz {r.get('ProductMz','')} z{r.get('PrecursorCharge','')}"
             fig.add_trace(go.Scatter(x=rt2, y=y2, mode="lines", name=label, opacity=0.6))
 
+        # ---- Peak1 RT dashed line ----
+        peak1_rt = _get_peak1_rt(rep_df)
+        if peak1_rt is not None:
+            fig.add_vline(
+                x=peak1_rt,
+                line_width=2,
+                line_dash="dash",
+                line_color="black",
+                annotation_text="Peak1",
+                annotation_position="top",
+            )
+
+        # ---- Peak2 RT dashed line (lighter / gray) ----
+        peak2_rt = _get_peak2_rt(rep_df)
+        if peak2_rt is not None:
+            fig.add_vline(
+                x=peak2_rt,
+                line_width=1,
+                line_dash="dot",
+                line_color="gray",
+                annotation_text="Peak2",
+                annotation_position="top",
+            )
+
+
+
         fig.update_layout(
             title=title,
             xaxis_title="RT (min)",
@@ -194,6 +250,31 @@ def plot_replicate_overlay(rep_df: pd.DataFrame, title: str, *, max_traces: int,
         y = _as_list(r.get("intensity"))
         rt2, y2 = _downsample_xy(rt, y, max_points=max_points)
         ax.plot(rt2, y2, alpha=0.7)
+
+    # ---- Peak1 RT dashed line ----
+    peak1_rt = _get_peak1_rt(rep_df)
+    if peak1_rt is not None:
+        ax.axvline(
+            peak1_rt,
+            linestyle="--",
+            linewidth=2,
+            color="black",
+            label="Peak1",
+        )
+        ax.legend()
+
+    # ---- Peak2 RT dashed line (lighter / gray) ----
+    peak2_rt = _get_peak2_rt(rep_df)
+    if peak2_rt is not None:
+        ax.axvline(
+            peak2_rt,
+            linestyle=":",
+            linewidth=1.5,
+            color="gray",
+            label="Peak2",
+        )
+        ax.legend()
+
 
     ax.set_title(title)
     ax.set_xlabel("RT (min)")

@@ -62,7 +62,7 @@ class SplitConfig:
     partial_valley_frac_max: float = 0.75
     min_rt_separation: float = 0.05
     consensus_rule: str = "majority_then_worst"
-    max_rt_delta_for_split: float = 1.5
+    max_rt_delta_for_split: float = 1.0
     boundary_pad_min: float = 0.15
 
     shoulder_valley_frac_max: float = 0.90

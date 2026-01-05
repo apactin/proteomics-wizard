@@ -18,6 +18,7 @@ from proteomics_app.pipeline import (
 )
 
 from proteomics_app.viewer.chrom_viewer import render_viewer
+from proteomics_app.viewer.stats_viewer import render_stats
 
 
 st.set_page_config(layout="wide")
@@ -253,7 +254,7 @@ outputs_dir: Path = Path(run_ctx.outputs_dir)
 # -------------------------
 # Tabs: Pipeline vs Viewer
 # -------------------------
-tab_pipeline, tab_viewer = st.tabs(["Pipeline", "Viewer"])
+tab_pipeline, tab_viewer, tab_stats = st.tabs(["Pipeline", "Viewer", "Stats"])
 
 # -------------------------
 # Pipeline tab
@@ -501,3 +502,18 @@ with tab_viewer:
                 traces_path=outs.traces_parquet,
                 embedded=True,
             )
+
+# -------------------------
+# Stats tab
+# -------------------------
+with tab_stats:
+    outs = st.session_state.outputs
+    if outs is None:
+        st.info("No run loaded. Run the pipeline or load a saved run from the sidebar.")
+    else:
+        # Use Step 4 workbook if present; fallback to Step 2 stereo workbook
+        render_stats(
+            stereo_xlsx=getattr(outs, "stereo_xlsx", None),
+            split_xlsx=getattr(outs, "split_xlsx", None),
+            embedded=True,
+        )
