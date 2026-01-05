@@ -10,6 +10,6 @@ Unzip
 
 Run docker compose up
 
-Open http://localhost:8501
+Open http://localhost:8525
 
 That’s it.
