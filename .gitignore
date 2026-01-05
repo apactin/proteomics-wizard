@@ -6,7 +6,11 @@ __pycache__/
 .venv/
 
 # Streamlit
+saved_runs/
+runs/
 .streamlit/
+*.parquet
+*.xlsx
 
 # Docker
 data/
