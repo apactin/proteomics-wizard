@@ -33,6 +33,8 @@ from urllib3.util.retry import Retry
 
 from openpyxl.utils import get_column_letter
 
+import os
+
 
 LogFn = Callable[[str], None]
 
@@ -298,7 +300,12 @@ def run(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_dir = Path(cache_dir) if cache_dir is not None else (Path.home() / ".stereoselectivity_cache" / "uniprot")
+    env_cache = os.environ.get("UNIPROT_CACHE_DIR", "").strip()
+    if cache_dir is None:
+        cache_dir = Path(env_cache) if env_cache else (Path.home() / ".stereoselectivity_cache" / "uniprot")
+    else:
+        cache_dir = Path(cache_dir)
+
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     session = _make_session(cfg)
