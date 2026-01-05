@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "proteomics-app"
+version = "0.1.0"
+description = "Streamlit wizard + pipeline runner for proteomics stereoselectivity + Skyline split-peak assessment"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "UCSF" }
+authors = [
+  { name = "Oliver Sampson-Tonge" }
+]
+
+dependencies = [
+  "streamlit>=1.36",
+  "pandas>=2.1",
+  "numpy>=1.24",
+  "openpyxl>=3.1",
+  "requests>=2.31",
+  "urllib3>=2.0",
+  "pyarrow>=14.0",
+  "plotly>=5.18"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+  "black>=24.0",
+  "mypy>=1.8"
+]
+
+# Tell the build system where your package lives
+[tool.hatch.build.targets.wheel]
+packages = ["proteomics_app"]
+
+# Optional but handy: lint/format defaults (safe to remove if you don't want them)
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]

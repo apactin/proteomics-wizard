@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+
+# Streamlit
+.streamlit/
+
+# Docker
+data/
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db

@@ -1,0 +1,9 @@
+services:
+  proteomics-wizard:
+    build: .
+    ports:
+      - "8525:8525"
+    environment:
+      - RUNS_DIR=/data/saved_runs
+    volumes:
+      - ./data:/data
