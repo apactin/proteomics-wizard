@@ -25,7 +25,7 @@ st.title("Proteomics Pipeline Wizard")
 
 st.markdown(
     """
-This wizard runs your 4-step pipeline end-to-end:
+This wizard runs a 4-step pipeline end-to-end:
 
 1) Compile CSVs → `merged_log2fc.xlsx`  
 2) Stereoselectivity + UniProt → `merged_log2fc_results.xlsx`  
@@ -120,15 +120,20 @@ def _infer_ms_and_window(filename: str) -> tuple[str, str]:
     Return (ms_level, window) where:
       ms_level in {"ms2","ms3",""}
       window in {"0s","5s","30s",""}
+    IMPORTANT: avoid '0s' matching inside '30s'.
     """
     fn = (filename or "").lower()
+
     ms = "ms3" if "ms3" in fn else ("ms2" if "ms2" in fn else "")
-    win = ""
-    for w in ("0s", "5s", "30s"):
-        if re.search(rf"\b{w}\b", fn) or (w in fn):
-            win = w
-            break
-    return ms, win
+
+    # Check 30s before 0s, and use token-ish matching
+    for w in ("30s", "5s", "0s"):
+        if re.search(rf"(^|[^0-9a-z]){w}([^0-9a-z]|$)", fn):
+            return ms, w
+
+    return ms, ""
+
+
 
 
 def _validate_step1_files(files) -> tuple[bool, str]:

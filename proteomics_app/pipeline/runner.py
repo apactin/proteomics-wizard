@@ -30,8 +30,6 @@ def _call_run(fn, /, *args, **kwargs):
 def _infer_identifier_from_filename(path: Path) -> str:
     """
     Infer window identifier from a CSV filename.
-    Supports patterns like:
-      MS3_0s.csv, ms3_5s_rep2.csv, something_MS2_30s.csv, etc.
 
     Returns "" if it cannot infer.
     """
@@ -42,24 +40,21 @@ def _infer_identifier_from_filename(path: Path) -> str:
         ms = "MS3"
     elif "ms2" in name:
         ms = "MS2"
-
     if ms is None:
         return ""
 
-    # Prefer explicit window tokens
-    if re.search(r"\b0s\b", name):
-        return f"{ms}_0s"
-    if re.search(r"\b5s\b", name):
-        return f"{ms}_5s"
-    if re.search(r"\b30s\b", name):
-        return f"{ms}_30s"
+    # Robust token-ish matching so '0s' does NOT match inside '30s'
+    # Accept separators like start, underscore, dash, space, dot, etc.
+    def has_token(tok: str) -> bool:
+        return re.search(rf"(^|[^0-9a-z]){re.escape(tok)}([^0-9a-z]|$)", name) is not None
 
-    # Fallback: look for _0s/_5s/_30s without word boundaries
-    for w in ("0s", "5s", "30s"):
-        if w in name:
+    for w in ("30s", "5s", "0s"):
+        if has_token(w):
             return f"{ms}_{w}"
 
+    # If we still can't find a token, don't do substring fallback that can misclassify.
     return ""
+
 
 
 def _make_unique_identifiers(specs: List[compile_data.InputSpec]) -> List[compile_data.InputSpec]:
