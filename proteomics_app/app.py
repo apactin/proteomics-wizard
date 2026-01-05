@@ -6,6 +6,7 @@ import json
 import time
 from typing import Optional
 import os
+import re
 
 import streamlit as st
 
@@ -112,6 +113,69 @@ def _load_run_from_manifest(manifest_path: Path):
 
 
 # -------------------------
+# Step 1 flexible helpers
+# -------------------------
+def _infer_ms_and_window(filename: str) -> tuple[str, str]:
+    """
+    Return (ms_level, window) where:
+      ms_level in {"ms2","ms3",""}
+      window in {"0s","5s","30s",""}
+    """
+    fn = (filename or "").lower()
+    ms = "ms3" if "ms3" in fn else ("ms2" if "ms2" in fn else "")
+    win = ""
+    for w in ("0s", "5s", "30s"):
+        if re.search(rf"\b{w}\b", fn) or (w in fn):
+            win = w
+            break
+    return ms, win
+
+
+def _validate_step1_files(files) -> tuple[bool, str]:
+    """
+    Minimal validation:
+      - At least one MS2 CSV and at least one MS3 CSV
+    (Allows any number of injections per condition.)
+    """
+    ms2 = 0
+    ms3 = 0
+    unknown = 0
+    for f in files or []:
+        name = (getattr(f, "name", "") or "")
+        ms, _ = _infer_ms_and_window(name)
+        if ms == "ms2":
+            ms2 += 1
+        elif ms == "ms3":
+            ms3 += 1
+        else:
+            unknown += 1
+
+    if ms2 == 0 or ms3 == 0:
+        return (
+            False,
+            f"Step 1 needs at least one MS2 CSV and one MS3 CSV. Detected: MS2={ms2}, MS3={ms3}, unknown={unknown}. "
+            "Make sure filenames include 'MS2' or 'MS3' (and ideally 0s/5s/30s).",
+        )
+    return True, ""
+
+
+def _save_step1_csvs(files, uploads_dir: Path) -> list[Path]:
+    """
+    Save all uploaded Step 1 CSVs into uploads_dir, keeping original names.
+    Returns list of saved file Paths.
+    """
+    saved: list[Path] = []
+    for f in files or []:
+        name = (getattr(f, "name", "") or "").strip()
+        if not name:
+            continue
+        dest = uploads_dir / name
+        save_uploaded_file_as(f, dest)
+        saved.append(dest)
+    return saved
+
+
+# -------------------------
 # Session state
 # -------------------------
 if "run_ctx" not in st.session_state:
@@ -193,10 +257,14 @@ with tab_pipeline:
     st.header("Step 1: Upload CSVs (batch)")
 
     step1_files = st.file_uploader(
-        "Upload all 5 CSVs at once (MS3_0s, MS3_5s, MS3_30s, MS2_5s, MS2_30s)",
+        "Upload any number of LFC CSVs (filenames should include MS2/MS3 and ideally 0s/5s/30s)",
         type=["csv"],
         accept_multiple_files=True,
     )
+
+    ok1, msg1 = _validate_step1_files(step1_files)
+    if step1_files and not ok1:
+        st.warning(msg1)
 
     st.header("Step 3: Upload peptide mapping files (batch)")
 
@@ -236,19 +304,9 @@ with tab_pipeline:
             out[name.lower()] = f
         return out
 
-    # Build indices
-    idx1 = _index_uploads(step1_files)
+    # Build indices (Step 1 still indexed, but only Step 3/4 use missing logic)
     idx3 = _index_uploads(step3_files)
     idx4 = _index_uploads(step4_files)
-
-    # Required files by step (keys are "canonical output names" we will save as)
-    REQ_STEP1 = {
-        "MS3_0s.csv": ["ms3_0s.csv", "ms3_0s"],
-        "MS3_5s.csv": ["ms3_5s.csv", "ms3_5s"],
-        "MS3_30s.csv": ["ms3_30s.csv", "ms3_30s"],
-        "MS2_5s.csv": ["ms2_5s.csv", "ms2_5s"],
-        "MS2_30s.csv": ["ms2_30s.csv", "ms2_30s"],
-    }
 
     REQ_STEP3 = {
         "combined_peptide_MS3.tsv": ["combined_peptide_ms3.tsv", "combined_peptide_ms3"],
@@ -285,16 +343,15 @@ with tab_pipeline:
                 missing.append(canonical)
         return missing
 
-    missing1 = _missing_for(idx1, REQ_STEP1)
     missing3 = _missing_for(idx3, REQ_STEP3)
     missing4 = _missing_for(idx4, REQ_STEP4)
 
-    all_ok = (len(missing1) == 0) and (len(missing3) == 0) and (len(missing4) == 0)
+    all_ok = ok1 and (len(missing3) == 0) and (len(missing4) == 0)
 
     if (step1_files or step3_files or step4_files) and (not all_ok):
         st.warning(
             "Missing required files:\n"
-            + ("\n".join([f"Step 1: {m}" for m in missing1]) + "\n" if missing1 else "")
+            + (f"Step 1: {msg1}\n" if (step1_files and not ok1) else ("" if ok1 else "Step 1: Please upload MS2+MS3 CSVs.\n"))
             + ("\n".join([f"Step 3: {m}" for m in missing3]) + "\n" if missing3 else "")
             + ("\n".join([f"Step 4: {m}" for m in missing4]) + "\n" if missing4 else "")
         )
@@ -311,12 +368,10 @@ with tab_pipeline:
         try:
             log("Saving uploads into run folder...")
 
-            # ---- Step 1 save ----
-            ms3_0s = save_uploaded_file_as(_find_uploaded(idx1, REQ_STEP1["MS3_0s.csv"]), uploads_dir / "MS3_0s.csv")
-            ms3_5s = save_uploaded_file_as(_find_uploaded(idx1, REQ_STEP1["MS3_5s.csv"]), uploads_dir / "MS3_5s.csv")
-            ms3_30s = save_uploaded_file_as(_find_uploaded(idx1, REQ_STEP1["MS3_30s.csv"]), uploads_dir / "MS3_30s.csv")
-            ms2_5s = save_uploaded_file_as(_find_uploaded(idx1, REQ_STEP1["MS2_5s.csv"]), uploads_dir / "MS2_5s.csv")
-            ms2_30s = save_uploaded_file_as(_find_uploaded(idx1, REQ_STEP1["MS2_30s.csv"]), uploads_dir / "MS2_30s.csv")
+            # ---- Step 1 save (flexible) ----
+            step1_saved = _save_step1_csvs(step1_files, uploads_dir)
+            if len(step1_saved) == 0:
+                raise RuntimeError("No Step 1 CSVs were uploaded/saved.")
 
             # ---- Step 3 save ----
             combined_ms3 = save_uploaded_file_as(
@@ -354,12 +409,9 @@ with tab_pipeline:
                 uploads_dir / "MS3_peaks_report.csv",
             )
 
+            # NOTE: requires the updated PipelineInputs that supports step1_csvs
             pi = PipelineInputs(
-                ms3_0s_csv=ms3_0s,
-                ms3_5s_csv=ms3_5s,
-                ms3_30s_csv=ms3_30s,
-                ms2_5s_csv=ms2_5s,
-                ms2_30s_csv=ms2_30s,
+                step1_csvs=step1_saved,
                 combined_peptide_ms3=combined_ms3,
                 peptide_list_ms3=list_ms3,
                 combined_peptide_ms2=combined_ms2,
