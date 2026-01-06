@@ -11,6 +11,9 @@ runs/
 .streamlit/
 *.parquet
 *.xlsx
+demo_app.py
+demo_data/
+auth.py
 
 # Docker
 data/
