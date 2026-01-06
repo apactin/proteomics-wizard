@@ -12,6 +12,14 @@ Key behavior preserved:
     require ceil(n_windows_available / 2)
 - UniProt enrichment via rest.uniprot.org with on-disk JSON cache.
 
+Enhancement added:
+- "Rich" UniProt caching:
+    - caches raw entry JSON:   <cache_root>/uniprot_raw/<ID>.json
+    - caches summary JSON:     <cache_root>/uniprot_summary/<ID>.json
+- Writes per-run UniProt annotation artifact:
+    - <out_dir>/uniprot_annotations.jsonl
+    - (optional) <out_dir>/uniprot_annotations.parquet
+
 This module exposes:
   run(inputs, out_dir, ...) -> Outputs
 """
@@ -20,6 +28,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,12 +37,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import requests
+from openpyxl.utils import get_column_letter
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-from openpyxl.utils import get_column_letter
-
-import os
 
 
 LogFn = Callable[[str], None]
@@ -55,9 +61,16 @@ class StereoConfig:
     sign_flip_penalty: float = 0.3        # f_conf(True)=penalty, False=1
 
     # UniProt
-    uniprot_timeout_s: int = 8
+    uniprot_timeout_s: int = 12
     uniprot_retry_total: int = 4
     uniprot_backoff: float = 0.5
+
+    # Rich UniProt annotation
+    uniprot_rich: bool = True
+    uniprot_save_raw_json: bool = True
+    uniprot_write_run_artifact: bool = True
+    # Excel-friendly joiner for list-like fields
+    uniprot_list_joiner: str = "; "
 
 
 @dataclass(frozen=True)
@@ -107,22 +120,41 @@ def _make_session(cfg: StereoConfig) -> requests.Session:
         raise_on_status=False,
     )
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers["User-Agent"] = "stereoselectivity-lite/2.0"
+    s.headers["User-Agent"] = "stereoselectivity-lite/2.1"
     return s
 
 def _cache_json(path: Path, obj: dict) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(obj, f)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
     except Exception:
         pass
 
 def _load_cache(path: Path) -> Optional[dict]:
     try:
-        return json.load(open(path)) if path.exists() else None
+        return json.load(open(path, encoding="utf-8")) if path.exists() else None
     except Exception:
         return None
+
+def _safe_get(d: object, *keys: str) -> Optional[object]:
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+def _uniq_keep_order(items: Sequence[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        x = (x or "").strip()
+        if not x or x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
 
 
 # ---------------- Core analysis helpers ----------------
@@ -179,33 +211,241 @@ def _f_conf(flip: bool, penalty: float) -> float:
     return penalty if flip else 1.0
 
 
-# ---------------- UniProt enrichment ----------------
+# ---------------- UniProt enrichment (rich caching) ----------------
+
+def _extract_uniprot_disulfides(entry_json: dict) -> List[Tuple[int, int]]:
+    pairs: List[Tuple[int, int]] = []
+    for feat in entry_json.get("features", []) or []:
+        ftype = str(feat.get("type", "")).lower()
+        if ftype != "disulfide bond":
+            continue
+        loc = feat.get("location", {}) or {}
+        start = (
+            _safe_get(loc, "start", "value")
+            or _safe_get(loc, "begin", "value")
+            or loc.get("begin")
+            or loc.get("start")
+        )
+        end = (
+            _safe_get(loc, "end", "value")
+            or _safe_get(loc, "finish", "value")
+            or loc.get("end")
+            or loc.get("finish")
+        )
+        try:
+            if isinstance(start, dict):
+                start = start.get("value")
+            if isinstance(end, dict):
+                end = end.get("value")
+            if start and end:
+                pairs.append((int(start), int(end)))
+        except Exception:
+            continue
+    return pairs
+
+
+def _extract_uniprot_rich_summary(pid: str, entry_json: dict, seq: Optional[str], pairs: List[Tuple[int, int]]) -> Dict:
+    # protein name
+    protein_name = (
+        _safe_get(entry_json, "proteinDescription", "recommendedName", "fullName", "value")
+        or _safe_get(entry_json, "proteinDescription", "submissionNames", 0, "fullName", "value")  # type: ignore
+        or _safe_get(entry_json, "proteinDescription", "alternativeNames", 0, "fullName", "value")  # type: ignore
+        or None
+    )
+    if isinstance(protein_name, dict):
+        protein_name = protein_name.get("value")
+
+    # genes
+    gene_names: List[str] = []
+    for g in entry_json.get("genes", []) or []:
+        gn = _safe_get(g, "geneName", "value")
+        if isinstance(gn, str):
+            gene_names.append(gn)
+        for syn in g.get("synonyms", []) or []:
+            sv = _safe_get(syn, "value")
+            if isinstance(sv, str):
+                gene_names.append(sv)
+
+    gene_names = _uniq_keep_order(gene_names)
+
+    # organism
+    organism = _safe_get(entry_json, "organism", "scientificName")
+    if not isinstance(organism, str):
+        organism = None
+
+    # keywords
+    keywords: List[str] = []
+    for kw in entry_json.get("keywords", []) or []:
+        name = kw.get("name")
+        if isinstance(name, str):
+            keywords.append(name)
+    keywords = _uniq_keep_order(keywords)
+
+    # GO terms (often appear in UniProt cross-references)
+    go_bp: List[str] = []
+    go_mf: List[str] = []
+    go_cc: List[str] = []
+
+    # UniProt REST JSON schema has varied a bit over time; try both common locations
+    xrefs = entry_json.get("uniProtKBCrossReferences") or entry_json.get("dbReferences") or []
+    if isinstance(xrefs, list):
+        for xr in xrefs:
+            db = xr.get("database") or xr.get("type")
+            if str(db).upper() != "GO":
+                continue
+            props = xr.get("properties") or {}
+            # properties can be dict or list of dicts depending on schema
+            term = None
+            if isinstance(props, dict):
+                term = props.get("GoTerm") or props.get("term")
+            elif isinstance(props, list):
+                for p in props:
+                    if p.get("key") in ("GoTerm", "term"):
+                        term = p.get("value")
+                        break
+            if not isinstance(term, str):
+                continue
+
+            # GO term looks like: "P:..."; "F:..."; "C:..."
+            if term.startswith("P:"):
+                go_bp.append(term[2:].strip())
+            elif term.startswith("F:"):
+                go_mf.append(term[2:].strip())
+            elif term.startswith("C:"):
+                go_cc.append(term[2:].strip())
+            else:
+                # if unknown, keep in BP as catch-all
+                go_bp.append(term.strip())
+
+    go_bp = _uniq_keep_order(go_bp)
+    go_mf = _uniq_keep_order(go_mf)
+    go_cc = _uniq_keep_order(go_cc)
+
+    # Subcellular location + pathway + function-ish notes commonly in comments
+    subcell: List[str] = []
+    pathways: List[str] = []
+    families: List[str] = []
+    ec_numbers: List[str] = []
+
+    # EC numbers sometimes in recommendedName
+    ec_list = _safe_get(entry_json, "proteinDescription", "recommendedName", "ecNumbers")
+    if isinstance(ec_list, list):
+        for ec in ec_list:
+            ev = ec.get("value")
+            if isinstance(ev, str):
+                ec_numbers.append(ev)
+
+    for c in entry_json.get("comments", []) or []:
+        ctype = str(c.get("commentType", "")).upper()
+
+        if ctype == "SUBCELLULAR LOCATION":
+            # Schema can include "subcellularLocations": [{"location":{"value":...}, ...}]
+            scl = c.get("subcellularLocations") or []
+            if isinstance(scl, list):
+                for item in scl:
+                    loc = _safe_get(item, "location", "value")
+                    if isinstance(loc, str):
+                        subcell.append(loc)
+
+        elif ctype == "PATHWAY":
+            # Schema can include "pathways": [{"name": {"value": ...}}] or "text": [...]
+            pls = c.get("pathways") or []
+            if isinstance(pls, list):
+                for p in pls:
+                    nm = _safe_get(p, "name", "value") or p.get("name")
+                    if isinstance(nm, str):
+                        pathways.append(nm)
+            # some schema uses "text" blocks
+            txt = c.get("texts") or c.get("text") or []
+            if isinstance(txt, list):
+                for t in txt:
+                    tv = t.get("value")
+                    if isinstance(tv, str) and "pathway" in tv.lower():
+                        pathways.append(tv)
+
+        elif ctype == "SIMILARITY":
+            # often contains protein family mentions in free text
+            txt = c.get("texts") or c.get("text") or []
+            if isinstance(txt, list):
+                for t in txt:
+                    tv = t.get("value")
+                    if isinstance(tv, str):
+                        # keep the whole line; stats viewer can tokenize later
+                        families.append(tv)
+
+    subcell = _uniq_keep_order(subcell)
+    pathways = _uniq_keep_order(pathways)
+    families = _uniq_keep_order(families)
+    ec_numbers = _uniq_keep_order(ec_numbers)
+
+    # sequence-derived
+    aa_len = len(seq) if isinstance(seq, str) else None
+    c_count = seq.count("C") if isinstance(seq, str) else None
+
+    disulfide_bonds = len(pairs)
+    disulfide_c = disulfide_bonds * 2 if disulfide_bonds else 0
+    c_frac = (c_count / aa_len) if aa_len and c_count is not None else None
+    pairs_str = ", ".join(f"Cys{a}–Cys{b}" for a, b in pairs) if pairs else "None"
+
+    # Return a stable, small summary schema
+    return {
+        "UniProt_ID": pid,
+        "UniProt_Protein_Name": protein_name,
+        "UniProt_Gene_Names": gene_names,  # list
+        "UniProt_Organism": organism,
+        "UniProt_Keywords": keywords,      # list
+        "UniProt_GO_BP": go_bp,            # list
+        "UniProt_GO_MF": go_mf,            # list
+        "UniProt_GO_CC": go_cc,            # list
+        "UniProt_Subcellular_Location": subcell,  # list
+        "UniProt_EC": ec_numbers,          # list
+        "UniProt_Pathway": pathways,       # list
+        "UniProt_Family": families,        # list (free-text lines)
+        # existing numeric features you already used
+        "AA_len": aa_len,
+        "Cys_count": c_count,
+        "Disulfide_Bond_Count": disulfide_bonds,
+        "Disulfide_Cys_Count": disulfide_c,
+        "Disulfide_Pairs_String": pairs_str,
+        "Cys_fraction": c_frac,
+    }
+
 
 def fetch_uniprot(
     pid: str,
     *,
     session: requests.Session,
-    cache_dir: Path,
+    cache_root: Path,
     timeout_s: int,
+    cfg: StereoConfig,
     log: Optional[LogFn] = None,
 ) -> Dict:
-    """Fetch UniProt sequence + disulfide pairs; caches JSON per protein ID."""
+    """
+    Fetch UniProt info with robust caching.
+
+    Cache layout:
+      <cache_root>/uniprot_summary/<pid>.json   (stable schema; what we merge/use)
+      <cache_root>/uniprot_raw/<pid>.json       (raw UniProt entry json; optional)
+    """
     pid = str(pid).strip()
     if not pid:
         return {}
 
-    cfile = cache_dir / f"{pid}.json"
-    cached = _load_cache(cfile)
-    if cached:
-        return cached
+    summary_file = cache_root / "uniprot_summary" / f"{pid}.json"
+    cached_summary = _load_cache(summary_file)
+    if cached_summary:
+        return cached_summary
+
+    raw_file = cache_root / "uniprot_raw" / f"{pid}.json"
 
     fasta_url = f"https://rest.uniprot.org/uniprotkb/{pid}.fasta"
     json_url = f"https://rest.uniprot.org/uniprotkb/{pid}"
 
     seq: Optional[str] = None
+    entry_json: dict = {}
     pairs: List[Tuple[int, int]] = []
 
-    # FASTA
+    # FASTA for sequence-derived metrics
     try:
         r = session.get(fasta_url, headers={"Accept": "text/plain"}, timeout=timeout_s)
         if r.ok and ">" in r.text:
@@ -214,62 +454,97 @@ def fetch_uniprot(
         if log:
             log(f"⚠️ FASTA fetch failed for {pid}: {e}")
 
-    # JSON features
+    # JSON entry for rich annotations + disulfides
     try:
         r = session.get(json_url, headers={"Accept": "application/json"}, timeout=timeout_s)
         if r.ok:
-            data = r.json()
-            for feat in data.get("features", []):
-                if feat.get("type", "").lower() == "disulfide bond":
-                    loc = feat.get("location", {})
-                    start = (
-                        loc.get("start", {}).get("value")
-                        or loc.get("begin", {}).get("value")
-                        or loc.get("begin")
-                        or loc.get("start")
-                    )
-                    end = (
-                        loc.get("end", {}).get("value")
-                        or loc.get("finish", {}).get("value")
-                        or loc.get("end")
-                        or loc.get("finish")
-                    )
-                    if isinstance(start, dict):
-                        start = start.get("value")
-                    if isinstance(end, dict):
-                        end = end.get("value")
-                    if start and end:
-                        try:
-                            pairs.append((int(start), int(end)))
-                        except Exception:
-                            continue
+            entry_json = r.json()
+            if cfg.uniprot_save_raw_json:
+                _cache_json(raw_file, entry_json)
+            pairs = _extract_uniprot_disulfides(entry_json)
+        else:
+            if log:
+                log(f"⚠️ UniProt JSON HTTP {r.status_code} for {pid}")
     except Exception as e:
         if log:
             log(f"⚠️ JSON fetch failed for {pid}: {e}")
 
-    if seq:
-        aa_len = len(seq)
-        c_count = seq.count("C")
+    # Build stable summary
+    if cfg.uniprot_rich and entry_json:
+        summary = _extract_uniprot_rich_summary(pid, entry_json, seq, pairs)
     else:
-        aa_len = None
-        c_count = None
+        # minimal fallback (original behavior)
+        aa_len = len(seq) if seq else None
+        c_count = seq.count("C") if seq else None
+        disulfide_bonds = len(pairs)
+        disulfide_c = disulfide_bonds * 2 if disulfide_bonds else 0
+        c_frac = (c_count / aa_len) if aa_len and c_count else None
+        pairs_str = ", ".join(f"Cys{a}–Cys{b}" for a, b in pairs) if pairs else "None"
+        summary = {
+            "UniProt_ID": pid,
+            "AA_len": aa_len,
+            "Cys_count": c_count,
+            "Disulfide_Bond_Count": disulfide_bonds,
+            "Disulfide_Cys_Count": disulfide_c,
+            "Disulfide_Pairs_String": pairs_str,
+            "Cys_fraction": c_frac,
+        }
 
-    disulfide_bonds = len(pairs)
-    disulfide_c = disulfide_bonds * 2 if disulfide_bonds else 0
-    c_frac = (c_count / aa_len) if aa_len and c_count else None
-    pairs_str = ", ".join(f"Cys{a}–Cys{b}" for a, b in pairs) if pairs else "None"
+    _cache_json(summary_file, summary)
+    return summary
 
-    info = {
-        "UniProt_ID": pid,
-        "AA_len": aa_len,
-        "Cys_count": c_count,
-        "Disulfide_Bond_Count": disulfide_bonds,
-        "Disulfide_Cys_Count": disulfide_c,
-        "Disulfide_Pairs_String": pairs_str,
-        "Cys_fraction": c_frac,
-    }
-    _cache_json(cfile, info)
-    return info
+
+def _resolve_cache_root(cache_dir: Optional[Path]) -> Path:
+    """
+    Priority:
+      1) explicit cache_dir arg
+      2) UNIPROT_CACHE_DIR env
+      3) PROTEOMICS_CACHE_DIR env (uses <that>/uniprot)
+      4) ~/.stereoselectivity_cache
+    """
+    if cache_dir is not None:
+        return Path(cache_dir)
+
+    env_uniprot = os.environ.get("UNIPROT_CACHE_DIR", "").strip()
+    if env_uniprot:
+        return Path(env_uniprot)
+
+    env_root = os.environ.get("PROTEOMICS_CACHE_DIR", "").strip()
+    if env_root:
+        return Path(env_root) / "uniprot"
+
+    return Path.home() / ".stereoselectivity_cache"
+
+
+def _write_uniprot_run_artifacts(out_dir: Path, df_u: pd.DataFrame, log: Optional[LogFn]) -> None:
+    """
+    Writes:
+      - uniprot_annotations.jsonl
+      - (optional) uniprot_annotations.parquet
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # JSONL: always available
+    jsonl_path = out_dir / "uniprot_annotations.jsonl"
+    try:
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for rec in df_u.to_dict(orient="records"):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if log:
+            log(f"✅ Wrote UniProt run artifact: {jsonl_path}")
+    except Exception as e:
+        if log:
+            log(f"⚠️ Failed writing {jsonl_path}: {e}")
+
+    # Parquet: best-effort
+    parquet_path = out_dir / "uniprot_annotations.parquet"
+    try:
+        df_u.to_parquet(parquet_path, index=False)
+        if log:
+            log(f"✅ Wrote UniProt run artifact: {parquet_path}")
+    except Exception:
+        # silently ignore if parquet engine not installed
+        pass
 
 
 # ---------------- Excel formatting ----------------
@@ -300,13 +575,8 @@ def run(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    env_cache = os.environ.get("UNIPROT_CACHE_DIR", "").strip()
-    if cache_dir is None:
-        cache_dir = Path(env_cache) if env_cache else (Path.home() / ".stereoselectivity_cache" / "uniprot")
-    else:
-        cache_dir = Path(cache_dir)
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_root = _resolve_cache_root(cache_dir)
+    cache_root.mkdir(parents=True, exist_ok=True)
 
     session = _make_session(cfg)
 
@@ -424,19 +694,28 @@ def run(
 
     # ---------- UniProt enrichment ----------
     uniprot_col_unique = _autodetect_column(df_unique, {"uniprot id", "uniprot", "accession"})
+    uinfo_df = None
+
     if uniprot_col_unique:
         ids = df_unique[uniprot_col_unique].dropna().astype(str).unique()
         _dbg(f"Fetching UniProt data for {len(ids)} proteins...", cfg, log)
 
         records = [
-            fetch_uniprot(pid, session=session, cache_dir=cache_dir, timeout_s=cfg.uniprot_timeout_s, log=log)
+            fetch_uniprot(pid, session=session, cache_root=cache_root, timeout_s=cfg.uniprot_timeout_s, cfg=cfg, log=log)
             for pid in ids
         ]
-        uinfo = pd.DataFrame(records)
+        uinfo_df = pd.DataFrame(records)
 
-        if "UniProt_ID" in uinfo.columns and uniprot_col_unique != "UniProt_ID":
-            uinfo.rename(columns={"UniProt_ID": uniprot_col_unique}, inplace=True)
+        # align join key name
+        if "UniProt_ID" in uinfo_df.columns and uniprot_col_unique != "UniProt_ID":
+            uinfo_df.rename(columns={"UniProt_ID": uniprot_col_unique}, inplace=True)
 
+        # Convert list-like columns to Excel-friendly strings for merge/export
+        list_cols = [c for c in uinfo_df.columns if c.startswith("UniProt_") and uinfo_df[c].apply(lambda x: isinstance(x, list)).any()]
+        for c in list_cols:
+            uinfo_df[c] = uinfo_df[c].apply(lambda x: cfg.uniprot_list_joiner.join(x) if isinstance(x, list) else (x if pd.notna(x) else ""))
+
+        # Ensure expected numeric columns exist
         expected_cols = [
             uniprot_col_unique,
             "AA_len",
@@ -447,11 +726,19 @@ def run(
             "Cys_fraction",
         ]
         for col in expected_cols:
-            if col not in uinfo.columns:
-                uinfo[col] = np.nan
+            if col not in uinfo_df.columns:
+                uinfo_df[col] = np.nan
 
-        df_unique = df_unique.merge(uinfo[expected_cols], on=uniprot_col_unique, how="left")
+        # Merge EVERYTHING we fetched (including rich string columns) into df_unique
+        df_unique = df_unique.merge(uinfo_df, on=uniprot_col_unique, how="left")
         _dbg("✅ UniProt enrichment merged successfully.", cfg, log)
+
+        # Write run-level artifacts (use original list form if available)
+        if cfg.uniprot_write_run_artifact and uinfo_df is not None:
+            # For artifacts, prefer list columns if we can reconstruct them from cached summaries
+            # BUT: we already stringified list cols for Excel; that's still fine for stats aggregation.
+            _write_uniprot_run_artifacts(out_dir, uinfo_df.copy(), log)
+
     else:
         _dbg("No UniProt column found, skipping enrichment.", cfg, log)
 
@@ -517,10 +804,10 @@ def run(
             if c2 in df_unique.columns:
                 padj_cols_existing_sorted.append(c2)
 
-    uniprot_cols_existing = [
-        c for c in df_unique.columns
-        if any(k in c.lower() for k in ["uniprot", "aa_", "cys", "disulfide", "pairs", "fraction"])
-    ]
+    # include UniProt columns (old + new rich columns)
+    uniprot_cols_existing = [c for c in df_unique.columns if c.lower().startswith("uniprot_") or any(
+        k in c.lower() for k in ["uniprot", "aa_", "cys", "disulfide", "pairs", "fraction"]
+    )]
     extra_meta_cols = [c for c in extra_meta_cols_existing if c in df_unique.columns]
 
     cols_common = [*group_cols]

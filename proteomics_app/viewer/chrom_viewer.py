@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import math
+import io
 from typing import Optional, Tuple, Any, Sequence
 
 import pandas as pd
@@ -84,6 +85,7 @@ def normalize_site(s: str) -> str:
     s = s.replace(" - ", "-").replace("- ", "-").replace(" -", "-")
     return s
 
+
 def _get_peak1_rt(rep_df: pd.DataFrame) -> Optional[float]:
     """
     Infer Peak1 RT for a replicate group.
@@ -97,7 +99,6 @@ def _get_peak1_rt(rep_df: pd.DataFrame) -> Optional[float]:
         return None
 
     return float(vals.median())
-
 
 
 def _get_peak2_rt(rep_df: pd.DataFrame) -> Optional[float]:
@@ -229,8 +230,6 @@ def plot_replicate_overlay(rep_df: pd.DataFrame, title: str, *, max_traces: int,
                 annotation_position="top",
             )
 
-
-
         fig.update_layout(
             title=title,
             xaxis_title="RT (min)",
@@ -275,11 +274,106 @@ def plot_replicate_overlay(rep_df: pd.DataFrame, title: str, *, max_traces: int,
         )
         ax.legend()
 
-
     ax.set_title(title)
     ax.set_xlabel("RT (min)")
     ax.set_ylabel("Intensity")
     st.pyplot(fig, clear_figure=True)
+
+
+# -------------------------
+# Selection helpers (global across panels)
+# -------------------------
+def _ensure_selected_state() -> None:
+    if "selected_sites" not in st.session_state:
+        st.session_state["selected_sites"] = set()
+
+
+def _update_global_selected_from_editor(
+    edited_df: pd.DataFrame,
+    *,
+    panel_key: str,
+    site_col: str = "Site",
+    pick_col: str = "Pick",
+) -> None:
+    """
+    Delta-sync global selection based on THIS panel's change only.
+
+    Why: Streamlit reruns the script and re-renders multiple data_editors (ms3/ms2/shared).
+    If you recompute global selection from each panel's full state, panels with stale UI
+    can wipe out new selections. Delta syncing prevents that.
+    """
+    _ensure_selected_state()
+    global_sel: set[str] = set(st.session_state["selected_sites"])
+
+    if edited_df is None or edited_df.empty or site_col not in edited_df.columns or pick_col not in edited_df.columns:
+        st.session_state["selected_sites"] = global_sel
+        return
+
+    panel_sites = set(edited_df[site_col].dropna().astype(str).tolist())
+    checked_now = set(
+        edited_df.loc[edited_df[pick_col].astype(bool), site_col].dropna().astype(str).tolist()
+    )
+
+    # Initialize panel state if missing (treat current as baseline; no delta)
+    panel_state_key = f"_panel_checked_{panel_key}"
+    if panel_state_key not in st.session_state:
+        st.session_state[panel_state_key] = set(checked_now)
+        st.session_state["selected_sites"] = global_sel | checked_now
+        return
+
+    checked_prev: set[str] = set(st.session_state.get(panel_state_key, set()))
+
+    # Apply only changes from previous -> current for this panel
+    added = checked_now - checked_prev
+    removed = checked_prev - checked_now
+
+    # Sanity: only affect sites actually in this panel
+    added = added & panel_sites
+    removed = removed & panel_sites
+
+    global_sel |= added
+    global_sel -= removed
+
+    st.session_state[panel_state_key] = set(checked_now)
+    st.session_state["selected_sites"] = global_sel
+
+def _apply_editor_state_to_pick(df: pd.DataFrame, editor_state: Any, pick_col: str = "Pick") -> pd.DataFrame:
+    """
+    Streamlit stores data_editor state in st.session_state[key] as a dict with 'edited_rows'.
+    Pre-apply those edits to df so the checkbox doesn't visually "bounce" on rerun.
+    """
+    if not isinstance(editor_state, dict):
+        return df
+    edited_rows = editor_state.get("edited_rows", {})
+    if not isinstance(edited_rows, dict) or pick_col not in df.columns:
+        return df
+
+    # edited_rows keys are row positions (0-based) in the rendered dataframe
+    for rpos, changes in edited_rows.items():
+        try:
+            if isinstance(changes, dict) and pick_col in changes:
+                df.iloc[int(rpos), df.columns.get_loc(pick_col)] = bool(changes[pick_col])
+        except Exception:
+            # ignore any out-of-range / type issues safely
+            pass
+    return df
+
+
+def _clear_other_panel_editors(current_panel: str) -> None:
+    """
+    When selection changes in one tab, clear the other tabs' editor widget states
+    so their tables rehydrate from global selected_sites (cross-tab sync).
+    """
+    for pk in ("ms3", "ms2", "shared"):
+        if pk == current_panel:
+            continue
+        k = f"hit_pick_{pk}"
+        if k in st.session_state:
+            del st.session_state[k]
+        # also clear delta-baseline so it re-initializes cleanly
+        ps = f"_panel_checked_{pk}"
+        if ps in st.session_state:
+            del st.session_state[ps]
 
 
 # -------------------------
@@ -546,9 +640,38 @@ def render_viewer(
         sites2 = sites2.sort_values(by="n_traces_filtered", ascending=False, na_position="last")
 
     # -------------------------
+    # Hit-list columns (single source of truth)
+    # -------------------------
+    HITLIST_COLS = ["Site", "Uniprot ID", "Best Peptide", "AA_len", "Cys_count"]
+    told = set()
+
+    for c in LFC_COLS:
+        if c in sites2.columns:
+            HITLIST_COLS.append(c)
+
+    HITLIST_COLS += [
+        "is_hit_ms2",
+        "is_hit_ms3",
+        SITE_CALL_COL,
+        "S_Score_MS3",
+        "S_Score_MS2",
+        "n_traces_total",
+        "n_traces_filtered",
+    ]
+
+    for c in ["sky_split_call_MS2", "sky_split_call_MS3"]:
+        if c in sites2.columns:
+            HITLIST_COLS.append(c)
+
+    HITLIST_COLS = [c for c in HITLIST_COLS if c in sites2.columns]
+
+    # -------------------------
     # Rendering
     # -------------------------
-    tab_ms3, tab_ms2, tab_shared = st.tabs(["MS3 hits", "MS2 hits", "Shared (MS2 ∩ MS3)"])
+    tab_ms3, tab_ms2, tab_shared, tab_selected = st.tabs(
+        ["MS3 hits", "MS2 hits", "Shared (MS2 ∩ MS3)", "Selected sites"]
+    )
+    _ensure_selected_state()
 
     def render_one_site(srow: pd.Series, panel_key: str, row_idx: int):
         site_norm = str(srow.get("Site_norm", "")).strip()
@@ -665,34 +788,52 @@ def render_viewer(
             if st.button("➡️", key=f"viewer_next_{panel_key}", disabled=(st.session_state[k] >= total_pages)):
                 st.session_state[k] = min(total_pages, st.session_state[k] + 1)
 
-
     def render_panel(panel_df: pd.DataFrame, panel_key: str, title2: str):
         st.subheader(title2)
         st.write(f"Sites shown: **{len(panel_df)}** (filtered by MS + site-level call selection)")
 
-        show_cols = ["Site", "Uniprot ID", "Best Peptide", "AA_len", "Cys_count"]
-        for c in LFC_COLS:
-            if c in panel_df.columns:
-                show_cols.append(c)
+        show_cols = HITLIST_COLS
 
-        show_cols += [
-            "is_hit_ms2",
-            "is_hit_ms3",
-            SITE_CALL_COL,
-            "S_Score_MS3",
-            "S_Score_MS2",
-            "n_traces_total",
-            "n_traces_filtered",
-        ]
-        for c in ["sky_split_call_MS2", "sky_split_call_MS3"]:
-            if c in panel_df.columns:
-                show_cols.append(c)
-
-        show_cols = [c for c in show_cols if c in panel_df.columns]
+        _ensure_selected_state()
+        global_sel: set[str] = set(st.session_state["selected_sites"])
 
         hit_df = panel_df[show_cols].copy()
         hit_df.insert(0, "#", range(1, len(hit_df) + 1))
-        st.dataframe(hit_df, width="stretch", height=260, hide_index=True)
+
+        # --- Checkbox column (global selection) ---
+        hit_df.insert(0, "Pick", hit_df["Site"].astype(str).isin(global_sel))
+
+        # Stable row identity
+        hit_df["_row_id"] = hit_df["Uniprot ID"].astype(str) + " | " + hit_df["Site"].astype(str)
+        hit_df = hit_df.set_index("_row_id", drop=True)
+
+        editor_key = f"hit_pick_{panel_key}"
+
+        # IMPORTANT: Pre-apply any pending checkbox edits from the editor widget state
+        # so the UI doesn't "uncheck then recheck" (bounce).
+        hit_df = _apply_editor_state_to_pick(hit_df, st.session_state.get(editor_key), pick_col="Pick")
+
+        edited = st.data_editor(
+            hit_df,
+            width="stretch",
+            height=260,
+            hide_index=True,
+            disabled=[c for c in hit_df.columns if c != "Pick"],
+            column_config={
+                "Pick": st.column_config.CheckboxColumn("✓", help="Add/remove this site from Selected sites")
+            },
+            key=editor_key,
+        )
+
+        # Update global selection from this panel's edited dataframe
+        before = set(st.session_state.get("selected_sites", set()))
+        _update_global_selected_from_editor(edited, panel_key=panel_key, site_col="Site", pick_col="Pick")
+        after = set(st.session_state.get("selected_sites", set()))
+
+        # If selection changed, clear other tabs' editor states so they reflect it immediately
+        if after != before:
+            _clear_other_panel_editors(current_panel=panel_key)
+
 
         st.divider()
 
@@ -728,9 +869,54 @@ def render_viewer(
         for i, (_, row) in enumerate(page_df.iterrows()):
             render_one_site(row, panel_key=panel_key, row_idx=start_idx + i)
 
+    def _make_selected_xlsx_bytes(summary_df: pd.DataFrame, full_df: pd.DataFrame) -> bytes:
+        bio = io.BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as w:
+            summary_df.to_excel(w, sheet_name="Summary", index=False)
+            full_df.to_excel(w, sheet_name="All_Columns", index=False)
+        return bio.getvalue()
+
+    
     with tab_ms3:
         render_panel(sites2[sites2["is_hit_ms3"]].copy(), "ms3", "MS3 hits (inclusive)")
     with tab_ms2:
         render_panel(sites2[sites2["is_hit_ms2"]].copy(), "ms2", "MS2 hits (inclusive)")
     with tab_shared:
         render_panel(sites2[sites2["is_hit_shared"]].copy(), "shared", "Shared hits (MS2 ∩ MS3)")
+
+    with tab_selected:
+        _ensure_selected_state()
+        selected = sorted(set(st.session_state["selected_sites"]))
+
+        st.subheader("Selected sites")
+        st.caption(f"{len(selected)} selected")
+
+        if not selected:
+            st.info("No sites selected yet. Use the ✓ checkboxes in the hit lists to add sites here.")
+        else:
+            summary_cols = HITLIST_COLS
+            summary_df = sites2.loc[sites2["Site"].astype(str).isin(selected), summary_cols].copy()
+            summary_df = summary_df.sort_values(by="Site", kind="stable")
+
+            st.dataframe(summary_df, width="stretch", hide_index=True)
+
+            c1, c2, c3 = st.columns([1, 1, 2])
+            with c1:
+                if st.button("Clear selected", key="clear_selected_sites"):
+                    st.session_state["selected_sites"] = set()
+                    st.rerun()
+
+            with c2:
+                full_df = unique.loc[unique["Site"].astype(str).isin(selected)].copy()
+                xlsx_bytes = _make_selected_xlsx_bytes(summary_df=summary_df, full_df=full_df)
+                st.download_button(
+                    "Download XLSX",
+                    data=xlsx_bytes,
+                    file_name="selected_sites.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_selected_sites_xlsx",
+                )
+
+            with c3:
+                st.caption("Summary = same columns as hit list table; All_Columns = all columns from Unique_Sites")
+
